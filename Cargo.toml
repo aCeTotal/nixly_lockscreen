@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/locker",
+    "crates/render",
+    "crates/auth",
+    "crates/input",
+    "crates/idle",
+    "crates/lockguard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["aCeTotal <lars.oksendal@gmail.com>"]
+
+[workspace.dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.8"
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+raw-window-handle = "0.6"
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1.10"
+libc = "0.2"
+evdev = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
