@@ -102,12 +102,12 @@ impl BlurPipeline {
         w: u32,
         h: u32,
         passes: u32,
-    ) {
+    ) -> bool {
         let target_first = (w.max(2) / 2).max(1);
         if chain.len() == passes as usize
             && chain.first().map(|m| m.width == target_first).unwrap_or(false)
         {
-            return;
+            return false;
         }
         chain.clear();
         let mut cw = w.max(2) / 2;
@@ -139,6 +139,7 @@ impl BlurPipeline {
             cw = (cw / 2).max(1);
             ch = (ch / 2).max(1);
         }
+        true
     }
 
     pub fn render_blur(

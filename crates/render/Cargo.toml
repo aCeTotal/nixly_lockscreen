@@ -12,5 +12,7 @@ raw-window-handle.workspace = true
 pollster.workspace = true
 anyhow.workspace = true
 log.workspace = true
-rayon.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+naga = { version = "23", features = ["wgsl-in"] }

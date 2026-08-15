@@ -42,6 +42,45 @@ pub struct Renderer {
     username: String,
     fail_started: Option<f32>,
     last_status: Option<PromptStatus>,
+    frame_stats: FrameStats,
+}
+
+#[derive(Default)]
+struct FrameStats {
+    last: Option<Instant>,
+    count: u32,
+    sum_ms: f32,
+    max_ms: f32,
+    acq_sum_ms: f32,
+    acq_max_ms: f32,
+}
+
+impl FrameStats {
+    fn record(&mut self, now: Instant, acquire_ms: f32) {
+        if let Some(last) = self.last {
+            let delta = now.duration_since(last).as_secs_f32() * 1000.0;
+            self.count += 1;
+            self.sum_ms += delta;
+            self.max_ms = self.max_ms.max(delta);
+            self.acq_sum_ms += acquire_ms;
+            self.acq_max_ms = self.acq_max_ms.max(acquire_ms);
+            if self.count >= 240 {
+                log::debug!(
+                    "frame: avg {:.2}ms max {:.2}ms | acquire avg {:.2}ms max {:.2}ms",
+                    self.sum_ms / self.count as f32,
+                    self.max_ms,
+                    self.acq_sum_ms / self.count as f32,
+                    self.acq_max_ms
+                );
+                self.count = 0;
+                self.sum_ms = 0.0;
+                self.max_ms = 0.0;
+                self.acq_sum_ms = 0.0;
+                self.acq_max_ms = 0.0;
+            }
+        }
+        self.last = Some(now);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -69,7 +108,9 @@ impl Default for Renderer {
 impl Renderer {
     pub fn new() -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            // GL fallback removed: wgpu-hal 23 EGL probing can panic (BadDisplay)
+            // and take the whole locker down before anything is drawn.
+            backends: wgpu::Backends::VULKAN,
             flags: wgpu::InstanceFlags::default(),
             dx12_shader_compiler: Default::default(),
             gles_minor_version: Default::default(),
@@ -96,6 +137,7 @@ impl Renderer {
             username: String::new(),
             fail_started: None,
             last_status: None,
+            frame_stats: FrameStats::default(),
         }
     }
 
@@ -184,7 +226,7 @@ impl Renderer {
         if self.device_state.is_none() {
             let adapter = pollster::block_on(self.instance.request_adapter(
                 &wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    power_preference: wgpu::PowerPreference::LowPower,
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
                 },
@@ -195,7 +237,10 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("nixly-lockscreen"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    // downlevel_defaults caps textures at 2048px, which fails on
+                    // 1440p/4K outputs; lift to what the adapter actually supports.
+                    required_limits: wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits()),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -254,6 +299,7 @@ impl Renderer {
             bg_width: screenshot.width,
             bg_height: screenshot.height,
             mip_chain: Vec::new(),
+            blurred_offset: None,
             _bg_texture: bg_texture,
         });
         Ok(id)
@@ -297,9 +343,14 @@ impl Renderer {
         let ds = self.device_state.as_mut().context("no device")?;
         let o = self.outputs.get_mut(id.0).context("no output")?;
 
-        ds.blur
+        let chain_rebuilt = ds
+            .blur
             .ensure_chain(&ds.device, &mut o.mip_chain, o.width, o.height, blur_passes);
+        if chain_rebuilt {
+            o.blurred_offset = None;
+        }
 
+        let acquire_start = Instant::now();
         let frame = match o.surface.get_current_texture() {
             Ok(f) if f.suboptimal => {
                 drop(f);
@@ -339,6 +390,11 @@ impl Renderer {
             }
             Err(e) => return Err(e.into()),
         };
+        let acquire_end = Instant::now();
+        if id.0 == 0 {
+            let acquire_ms = acquire_end.duration_since(acquire_start).as_secs_f32() * 1000.0;
+            self.frame_stats.record(acquire_end, acquire_ms);
+        }
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -348,15 +404,18 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        ds.blur.render_blur(
-            &ds.device,
-            &mut encoder,
-            &o.bg_view,
-            o.bg_width,
-            o.bg_height,
-            &o.mip_chain,
-            effective_blur_offset,
-        );
+        if o.blurred_offset != Some(effective_blur_offset) {
+            ds.blur.render_blur(
+                &ds.device,
+                &mut encoder,
+                &o.bg_view,
+                o.bg_width,
+                o.bg_height,
+                &o.mip_chain,
+                effective_blur_offset,
+            );
+            o.blurred_offset = Some(effective_blur_offset);
+        }
 
         let blurred_view = if let Some(first) = o.mip_chain.first() {
             &first.view
@@ -368,6 +427,8 @@ impl Renderer {
             &ds.device,
             &ds.queue,
             &mut encoder,
+            id.0,
+            chain_rebuilt,
             blurred_view,
             &view,
             o.width,

@@ -13,5 +13,6 @@ pub(crate) struct OutputState {
     pub bg_width: u32,
     pub bg_height: u32,
     pub mip_chain: Vec<MipLevel>,
+    pub blurred_offset: Option<f32>,
     pub _bg_texture: wgpu::Texture,
 }

@@ -1,5 +1,3 @@
-use wgpu::util::DeviceExt;
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -23,8 +21,10 @@ pub struct UiQuad {
 pub struct UiPipeline {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
+    ub: wgpu::Buffer,
     quads_buffer: wgpu::Buffer,
     quads_capacity: u64,
+    bind_group: Option<wgpu::BindGroup>,
 }
 
 impl UiPipeline {
@@ -99,12 +99,20 @@ impl UiPipeline {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ub = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui ub"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             pipeline,
             bgl,
+            ub,
             quads_buffer,
             quads_capacity: initial_cap,
+            bind_group: None,
         }
     }
 
@@ -131,6 +139,7 @@ impl UiPipeline {
                 mapped_at_creation: false,
             });
             self.quads_capacity = new_cap;
+            self.bind_group = None;
         }
         queue.write_buffer(&self.quads_buffer, 0, bytemuck::cast_slice(quads));
 
@@ -139,25 +148,25 @@ impl UiPipeline {
             _pad0: 0.0,
             _pad1: 0.0,
         };
-        let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ui ub"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ui bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ub.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.quads_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        queue.write_buffer(&self.ub, 0, bytemuck::bytes_of(&uniforms));
+
+        if self.bind_group.is_none() {
+            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ui bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ub.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.quads_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+        let bg = self.bind_group.as_ref().unwrap();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -173,7 +182,7 @@ impl UiPipeline {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.draw(0..6, 0..(quads.len() as u32));
     }
 }

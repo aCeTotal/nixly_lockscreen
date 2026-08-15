@@ -152,6 +152,7 @@ struct LockSurface {
     height: u32,
     output_id: Option<OutputId>,
     pending_render: bool,
+    last_render: Option<Instant>,
 }
 
 struct State {
@@ -186,9 +187,15 @@ struct State {
 }
 
 const MAX_PASSWORD_LEN: usize = 128;
-const PROMPT_TIMEOUT_S: f32 = 10.0;
+const PROMPT_TIMEOUT_S: f32 = 15.0;
 const FAIL_FLASH_S: f32 = 1.2;
-const IDLE_TO_SCREENSAVER_S: f32 = 20.0;
+const IDLE_TO_SCREENSAVER_S: f32 = 15.0;
+// Minimum interval between rendered frames. On high-refresh outputs (this
+// panel does 300 Hz) rendering every vsync misses the 3.3 ms budget and gives
+// an uneven cadence; skipping callbacks until ~a 60 fps step has passed locks
+// the animation to a stable rate instead. On 60 Hz outputs every callback
+// still renders.
+const FRAME_MIN_INTERVAL_MS: f32 = 13.5;
 const AUTO_VERIFY_DEBOUNCE_MS: u128 = 1000;
 const AUTO_VERIFY_MIN_LEN: usize = 4;
 
@@ -213,6 +220,7 @@ impl State {
                 height: 0,
                 output_id: None,
                 pending_render: false,
+                last_render: None,
             });
         }
     }
@@ -258,8 +266,14 @@ impl State {
     fn render_surface(&mut self, idx: usize) {
         self.tick_prompt();
 
-        let wl = self.lock_surfaces[idx].surface.wl_surface().clone();
-        wl.frame(&self.qh, wl.clone());
+        // Request the frame callback without committing: an empty commit before
+        // the first buffer is a session-lock protocol error (null_buffer). The
+        // wgpu present below commits the surface and carries the request along.
+        if !self.lock_surfaces[idx].pending_render {
+            let wl = self.lock_surfaces[idx].surface.wl_surface().clone();
+            wl.frame(&self.qh, wl.clone());
+            self.lock_surfaces[idx].pending_render = true;
+        }
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -270,7 +284,6 @@ impl State {
         if let Err(e) = renderer.render(id) {
             log::warn!("render error: {e}");
         }
-        self.lock_surfaces[idx].pending_render = false;
     }
 
     fn tick_prompt(&mut self) {
@@ -416,10 +429,15 @@ impl State {
     }
 
     fn request_all_frames(&mut self) {
-        for s in &self.lock_surfaces {
+        for s in &mut self.lock_surfaces {
+            // Never commit a surface that has not presented a buffer yet.
+            if s.pending_render || s.output_id.is_none() {
+                continue;
+            }
             let wl = s.surface.wl_surface().clone();
             wl.frame(&self.qh, wl.clone());
             wl.commit();
+            s.pending_render = true;
         }
     }
 
@@ -550,7 +568,22 @@ impl CompositorHandler for State {
             .iter()
             .position(|s| s.surface.wl_surface() == surface);
         if let Some(idx) = idx {
-            self.render_surface(idx);
+            self.lock_surfaces[idx].pending_render = false;
+            let due = self.lock_surfaces[idx]
+                .last_render
+                .map(|t| t.elapsed().as_secs_f32() * 1000.0 >= FRAME_MIN_INTERVAL_MS)
+                .unwrap_or(true);
+            if due {
+                self.lock_surfaces[idx].last_render = Some(Instant::now());
+                self.render_surface(idx);
+            } else {
+                // Too early: re-arm the callback without rendering. The surface
+                // already has a buffer, so an empty commit is legal here.
+                let wl = self.lock_surfaces[idx].surface.wl_surface().clone();
+                wl.frame(&self.qh, wl.clone());
+                wl.commit();
+                self.lock_surfaces[idx].pending_render = true;
+            }
         }
     }
 
