@@ -4,6 +4,16 @@
 let
   cfg = config.services.nixly-lockscreen;
   pkg = self.packages.${pkgs.system}.default;
+
+  # True when the system logs in automatically (getty, display manager or
+  # greetd autologin). With autologin there is no password boundary anyway,
+  # so the locker defaults to screensaver-only mode: matrix rain, any input
+  # unlocks straight to the desktop.
+  autoLoginActive =
+    (config.services.displayManager.autoLogin.enable or false)
+    || ((config.services.getty.autologinUser or null) != null)
+    || ((config.services.greetd.enable or false)
+        && ((config.services.greetd.settings or { }) ? initial_session));
 in
 {
   options.services.nixly-lockscreen = {
@@ -21,6 +31,17 @@ in
       description = "Mask ctrl-alt-del.target so Ctrl+Alt+Del cannot reboot the machine.";
     };
 
+    skipAuth = lib.mkOption {
+      type = lib.types.bool;
+      default = autoLoginActive;
+      defaultText = lib.literalMD "`true` when NixOS autologin is configured";
+      description = ''
+        Skip the password prompt: show matrix rain only, and unlock straight
+        to the desktop on any input. Defaults to true when autologin
+        (getty/displayManager/greetd) is active on the system.
+      '';
+    };
+
     pamService = lib.mkOption {
       type = lib.types.str;
       default = "nixly-lockscreen";
@@ -30,6 +51,10 @@ in
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
+
+    environment.sessionVariables = lib.mkIf cfg.skipAuth {
+      NIXLY_LOCKSCREEN_NO_AUTH = "1";
+    };
 
     security.pam.services.${cfg.pamService} = {
       text = ''

@@ -55,8 +55,15 @@ fn connect_lockguard() -> Option<std::os::unix::net::UnixStream> {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let no_auth = std::env::var("NIXLY_LOCKSCREEN_NO_AUTH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     let _guard_sock = if DEMO_MODE {
         log::warn!("DEMO_MODE: skipping lockguard, auth, prompt UI. ESC to exit.");
+        None
+    } else if no_auth {
+        log::info!("no-auth mode (autologin): skipping lockguard; any input unlocks");
         None
     } else {
         connect_lockguard()
@@ -99,6 +106,7 @@ fn main() -> Result<()> {
         awake: false,
         cursor_output: None,
         last_auto_attempt: None,
+        no_auth,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -184,6 +192,7 @@ struct State {
     awake: bool,
     cursor_output: Option<OutputId>,
     last_auto_attempt: Option<String>,
+    no_auth: bool,
 }
 
 const MAX_PASSWORD_LEN: usize = 128;
@@ -399,6 +408,17 @@ impl State {
 
     fn handle_input_activity(&mut self) -> bool {
         self.last_input = Instant::now();
+        if self.no_auth {
+            if !self.unlock_pending {
+                log::info!("no-auth mode: input received, unlocking");
+                self.unlock_pending = true;
+                if let Some(r) = self.renderer.as_mut() {
+                    r.start_unlock();
+                }
+                self.request_all_frames();
+            }
+            return true;
+        }
         if !self.awake {
             self.awake = true;
             if !self.authenticator.is_locked_out() {
