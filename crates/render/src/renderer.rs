@@ -59,6 +59,7 @@ impl FrameStats {
     fn record(&mut self, now: Instant, acquire_ms: f32) {
         if let Some(last) = self.last {
             let delta = now.duration_since(last).as_secs_f32() * 1000.0;
+            log::trace!("dt {:.3} acq {:.3}", delta, acquire_ms);
             self.count += 1;
             self.sum_ms += delta;
             self.max_ms = self.max_ms.max(delta);

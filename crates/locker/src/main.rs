@@ -195,7 +195,14 @@ const IDLE_TO_SCREENSAVER_S: f32 = 15.0;
 // an uneven cadence; skipping callbacks until ~a 60 fps step has passed locks
 // the animation to a stable rate instead. On 60 Hz outputs every callback
 // still renders.
-const FRAME_MIN_INTERVAL_MS: f32 = 13.5;
+//
+// The threshold must sit mid-window between vsync multiples: frame callbacks
+// arrive on the 3.331 ms vsync grid (300.185 Hz), so the gate decision
+// quantizes to 4 vsyncs (13.33 ms) or 5 vsyncs (16.66 ms). The old value 13.5
+// was only 175 us above 4x3.331 — sub-ms dispatch jitter (deep C-state
+// wakeups, clock slew) flipped frames between the two cadences for minutes at
+// a time, seen as periodic stutter. 15.0 is centred: ~1.6 ms margin each way.
+const FRAME_MIN_INTERVAL_MS: f32 = 15.0;
 const AUTO_VERIFY_DEBOUNCE_MS: u128 = 1000;
 const AUTO_VERIFY_MIN_LEN: usize = 4;
 
