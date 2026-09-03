@@ -107,6 +107,8 @@ fn main() -> Result<()> {
         cursor_output: None,
         last_auto_attempt: None,
         no_auth,
+        on_battery: on_battery(),
+        last_power_check: Instant::now(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -126,6 +128,7 @@ fn main() -> Result<()> {
 
     let mut renderer = Renderer::new();
     renderer.set_username(user);
+    renderer.set_power_save(state.on_battery);
     state.renderer = Some(renderer);
 
     state.create_lock_surfaces();
@@ -160,7 +163,6 @@ struct LockSurface {
     height: u32,
     output_id: Option<OutputId>,
     pending_render: bool,
-    last_render: Option<Instant>,
 }
 
 struct State {
@@ -193,26 +195,44 @@ struct State {
     cursor_output: Option<OutputId>,
     last_auto_attempt: Option<String>,
     no_auth: bool,
+    on_battery: bool,
+    last_power_check: Instant,
+}
+
+/* On battery the lockscreen shows a black background instead of matrix
+ * rain. Mirrors nixlytile's powersave rule: a Battery supply reporting
+ * "Discharging" means battery; anything else (AC, full, no battery at
+ * all — desktops) means wall power. */
+fn on_battery() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let is_battery = std::fs::read_to_string(p.join("type"))
+            .map(|t| t.trim() == "Battery")
+            .unwrap_or(false);
+        if !is_battery {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(p.join("status")) {
+            if status.trim() == "Discharging" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 const MAX_PASSWORD_LEN: usize = 128;
 const PROMPT_TIMEOUT_S: f32 = 15.0;
 const FAIL_FLASH_S: f32 = 1.2;
 const IDLE_TO_SCREENSAVER_S: f32 = 15.0;
-// Minimum interval between rendered frames. On high-refresh outputs (this
-// panel does 300 Hz) rendering every vsync misses the 3.3 ms budget and gives
-// an uneven cadence; skipping callbacks until ~a 60 fps step has passed locks
-// the animation to a stable rate instead. On 60 Hz outputs every callback
-// still renders.
-//
-// The threshold must sit mid-window between vsync multiples: frame callbacks
-// arrive on the 3.331 ms vsync grid (300.185 Hz), so the gate decision
-// quantizes to 4 vsyncs (13.33 ms) or 5 vsyncs (16.66 ms). The old value 13.5
-// was only 175 us above 4x3.331 — sub-ms dispatch jitter (deep C-state
-// wakeups, clock slew) flipped frames between the two cadences for minutes at
-// a time, seen as periodic stutter. 15.0 is centred: ~1.6 ms margin each way.
-const FRAME_MIN_INTERVAL_MS: f32 = 15.0;
 const AUTO_VERIFY_DEBOUNCE_MS: u128 = 1000;
+// On battery the background is a static black frame instead of matrix rain;
+// re-check the power state at this interval so plugging/unplugging while
+// locked switches mode without a restart.
+const POWER_CHECK_INTERVAL_S: u64 = 5;
 const AUTO_VERIFY_MIN_LEN: usize = 4;
 
 const DEMO_MODE: bool = false;
@@ -236,7 +256,6 @@ impl State {
                 height: 0,
                 output_id: None,
                 pending_render: false,
-                last_render: None,
             });
         }
     }
@@ -251,12 +270,29 @@ impl State {
             .as_mut()
             .context("renderer not initialised")?;
 
-        let capture = self
-            .captures
-            .iter()
-            .find(|c| c.output == surf.output)
-            .context("no capture for output")?;
-        let pixels = screencopy::shm_format_to_render_pixels(capture);
+        // Outputs that appear after the lock started (lid reopened after a
+        // lid-close suspend removed the panel) have no screenshot. Falling
+        // back to a solid dark background instead of erroring is critical:
+        // the error path left the lock surface without a buffer, so it never
+        // mapped — black screen, no prompt, no keyboard focus, session
+        // unrecoverable without a hard reboot.
+        let (pixels, cap_w, cap_h) = match self.captures.iter().find(|c| c.output == surf.output) {
+            Some(capture) => (
+                screencopy::shm_format_to_render_pixels(capture),
+                capture.width,
+                capture.height,
+            ),
+            None => {
+                log::warn!("no capture for output; using fallback background");
+                let (w, h) = (8u32, 8u32);
+                let mut px = vec![0u8; (w * h * 4) as usize];
+                for p in px.chunks_exact_mut(4) {
+                    // BGRA: dark slate #0b0f14
+                    p.copy_from_slice(&[0x14, 0x0f, 0x0b, 0xff]);
+                }
+                (px, w, h)
+            }
+        };
 
         let raw_display = make_display_handle(&self.conn)?;
         let raw_window = make_window_handle(surf.surface.wl_surface())?;
@@ -269,9 +305,9 @@ impl State {
         let id = renderer.add_output(
             target,
             &Screenshot {
-                width: capture.width,
-                height: capture.height,
-                stride: capture.width * 4,
+                width: cap_w,
+                height: cap_h,
+                stride: cap_w * 4,
                 pixels: &pixels,
             },
         )?;
@@ -303,6 +339,20 @@ impl State {
     }
 
     fn tick_prompt(&mut self) {
+        if self.last_power_check.elapsed().as_secs() >= POWER_CHECK_INTERVAL_S {
+            self.last_power_check = Instant::now();
+            let bat = on_battery();
+            if bat != self.on_battery {
+                self.on_battery = bat;
+                log::info!(
+                    "power: {}",
+                    if bat { "battery — black background" } else { "AC — matrix rain" }
+                );
+            }
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_power_save(self.on_battery);
+        }
         if DEMO_MODE {
             if let Some(r) = self.renderer.as_mut() {
                 r.set_awake(false);
@@ -594,23 +644,12 @@ impl CompositorHandler for State {
             .lock_surfaces
             .iter()
             .position(|s| s.surface.wl_surface() == surface);
+        // Render on every frame callback: the lockscreen runs at whatever
+        // refresh rate the compositor drives the output at (max — nixlytile
+        // forces the panel's top mode for the whole lock).
         if let Some(idx) = idx {
             self.lock_surfaces[idx].pending_render = false;
-            let due = self.lock_surfaces[idx]
-                .last_render
-                .map(|t| t.elapsed().as_secs_f32() * 1000.0 >= FRAME_MIN_INTERVAL_MS)
-                .unwrap_or(true);
-            if due {
-                self.lock_surfaces[idx].last_render = Some(Instant::now());
-                self.render_surface(idx);
-            } else {
-                // Too early: re-arm the callback without rendering. The surface
-                // already has a buffer, so an empty commit is legal here.
-                let wl = self.lock_surfaces[idx].surface.wl_surface().clone();
-                wl.frame(&self.qh, wl.clone());
-                wl.commit();
-                self.lock_surfaces[idx].pending_render = true;
-            }
+            self.render_surface(idx);
         }
     }
 

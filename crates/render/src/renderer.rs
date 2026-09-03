@@ -43,6 +43,7 @@ pub struct Renderer {
     fail_started: Option<f32>,
     last_status: Option<PromptStatus>,
     frame_stats: FrameStats,
+    power_save: bool,
 }
 
 #[derive(Default)]
@@ -139,7 +140,14 @@ impl Renderer {
             fail_started: None,
             last_status: None,
             frame_stats: FrameStats::default(),
+            power_save: false,
         }
+    }
+
+    /// Battery mode: plain black background, no matrix rain, no blur.
+    /// The prompt UI renders unchanged on top.
+    pub fn set_power_save(&mut self, on: bool) {
+        self.power_save = on;
     }
 
     pub fn set_username(&mut self, name: impl Into<String>) {
@@ -341,12 +349,16 @@ impl Renderer {
         let username = self.username.clone();
         let fail_age = self.fail_started.map(|t0| (time - t0).max(0.0));
 
+        let power_save = self.power_save;
         let ds = self.device_state.as_mut().context("no device")?;
         let o = self.outputs.get_mut(id.0).context("no output")?;
 
-        let chain_rebuilt = ds
-            .blur
-            .ensure_chain(&ds.device, &mut o.mip_chain, o.width, o.height, blur_passes);
+        let chain_rebuilt = if power_save {
+            false
+        } else {
+            ds.blur
+                .ensure_chain(&ds.device, &mut o.mip_chain, o.width, o.height, blur_passes)
+        };
         if chain_rebuilt {
             o.blurred_offset = None;
         }
@@ -405,40 +417,59 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        if o.blurred_offset != Some(effective_blur_offset) {
-            ds.blur.render_blur(
-                &ds.device,
-                &mut encoder,
-                &o.bg_view,
-                o.bg_width,
-                o.bg_height,
-                &o.mip_chain,
-                effective_blur_offset,
-            );
-            o.blurred_offset = Some(effective_blur_offset);
-        }
-
-        let blurred_view = if let Some(first) = o.mip_chain.first() {
-            &first.view
+        if power_save {
+            // Battery: static black background — no blur, no rain. The
+            // empty pass just clears; the UI pass below loads on top.
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("black bg"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
         } else {
-            &o.bg_view
-        };
+            if o.blurred_offset != Some(effective_blur_offset) {
+                ds.blur.render_blur(
+                    &ds.device,
+                    &mut encoder,
+                    &o.bg_view,
+                    o.bg_width,
+                    o.bg_height,
+                    &o.mip_chain,
+                    effective_blur_offset,
+                );
+                o.blurred_offset = Some(effective_blur_offset);
+            }
 
-        ds.rain.render(
-            &ds.device,
-            &ds.queue,
-            &mut encoder,
-            id.0,
-            chain_rebuilt,
-            blurred_view,
-            &view,
-            o.width,
-            o.height,
-            time,
-            backdrop_dim,
-            seed,
-            awake,
-        );
+            let blurred_view = if let Some(first) = o.mip_chain.first() {
+                &first.view
+            } else {
+                &o.bg_view
+            };
+
+            ds.rain.render(
+                &ds.device,
+                &ds.queue,
+                &mut encoder,
+                id.0,
+                chain_rebuilt,
+                blurred_view,
+                &view,
+                o.width,
+                o.height,
+                time,
+                backdrop_dim,
+                seed,
+                awake,
+            );
+        }
 
         let show_prompt = match prompt_output {
             Some(target) => target == *id,
