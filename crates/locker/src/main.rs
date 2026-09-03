@@ -163,6 +163,7 @@ struct LockSurface {
     height: u32,
     output_id: Option<OutputId>,
     pending_render: bool,
+    presented: bool,
 }
 
 struct State {
@@ -256,6 +257,7 @@ impl State {
                 height: 0,
                 output_id: None,
                 pending_render: false,
+                presented: false,
             });
         }
     }
@@ -327,14 +329,33 @@ impl State {
             self.lock_surfaces[idx].pending_render = true;
         }
 
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
+        let id = self.lock_surfaces[idx].output_id;
+        let presented = match (self.renderer.as_mut(), id) {
+            (Some(renderer), Some(id)) => match renderer.render(&id) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("render error: {e}");
+                    false
+                }
+            },
+            _ => false,
         };
-        let Some(id) = self.lock_surfaces[idx].output_id.as_ref() else {
-            return;
-        };
-        if let Err(e) = renderer.render(id) {
-            log::warn!("render error: {e}");
+        if presented {
+            self.lock_surfaces[idx].presented = true;
+        } else if self.lock_surfaces[idx].presented {
+            // The frame request above only reaches the compositor with a
+            // commit. If nothing was presented this pass, the request is
+            // orphaned, no callback ever fires and the render loop dies —
+            // the lockscreen freezes until some other path happens to
+            // commit (the recurring slow/fast cycle). A bare commit
+            // latches the request so the loop retries next vblank; only
+            // legal once a buffer has been attached.
+            self.lock_surfaces[idx].surface.wl_surface().commit();
+        } else {
+            // No buffer attached yet: a bare commit would be a session-
+            // lock protocol error. Drop the flag so the next configure or
+            // render attempt re-requests the callback.
+            self.lock_surfaces[idx].pending_render = false;
         }
     }
 
@@ -508,7 +529,7 @@ impl State {
     fn request_all_frames(&mut self) {
         for s in &mut self.lock_surfaces {
             // Never commit a surface that has not presented a buffer yet.
-            if s.pending_render || s.output_id.is_none() {
+            if s.pending_render || !s.presented {
                 continue;
             }
             let wl = s.surface.wl_surface().clone();

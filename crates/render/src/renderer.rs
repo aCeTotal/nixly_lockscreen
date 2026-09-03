@@ -386,6 +386,11 @@ impl Renderer {
             }
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                // Reconfigure and retry within the same pass: returning
+                // without presenting orphans the caller's frame request
+                // and kills the callback-driven render loop (happens on
+                // every modeset — the lock itself switches the panel to
+                // max refresh).
                 o.surface.configure(
                     &ds.device,
                     &wgpu::SurfaceConfiguration {
@@ -399,7 +404,9 @@ impl Renderer {
                         desired_maximum_frame_latency: 2,
                     },
                 );
-                return Ok(());
+                o.surface
+                    .get_current_texture()
+                    .map_err(anyhow::Error::from)?
             }
             Err(e) => return Err(e.into()),
         };
