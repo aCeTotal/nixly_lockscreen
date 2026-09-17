@@ -7,7 +7,7 @@ let
 
   # True when the system logs in automatically (getty, display manager or
   # greetd autologin). With autologin there is no password boundary anyway,
-  # so the locker defaults to screensaver-only mode: matrix rain, any input
+  # so the locker defaults to blank-screen mode: black screen, any input
   # unlocks straight to the desktop.
   autoLoginActive =
     (config.services.displayManager.autoLogin.enable or false)
@@ -36,7 +36,7 @@ in
       default = autoLoginActive;
       defaultText = lib.literalMD "`true` when NixOS autologin is configured";
       description = ''
-        Skip the password prompt: show matrix rain only, and unlock straight
+        Skip the password prompt: black screen only, and unlock straight
         to the desktop on any input. Defaults to true when autologin
         (getty/displayManager/greetd) is active on the system.
       '';

@@ -2,13 +2,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::blur::BlurPipeline;
 use crate::clock;
 use crate::font;
 use crate::output::{OutputId, OutputState};
-use crate::rain::RainPipeline;
 use crate::ui::{UiPipeline, UiQuad};
-use crate::{Screenshot, SurfaceTarget};
+use crate::SurfaceTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptStatus {
@@ -28,14 +26,9 @@ pub struct Renderer {
     instance: wgpu::Instance,
     device_state: Option<DeviceState>,
     outputs: Vec<OutputState>,
-    blur_passes: u32,
-    blur_offset: f32,
     start: Instant,
-    backdrop_dim: f32,
-    seed: f32,
     prompt: Option<PromptInfo>,
     prompt_output: Option<OutputId>,
-    awake: bool,
     prompt_dots: Vec<DotAnim>,
     last_chars: u32,
     unlock_started: Option<f32>,
@@ -43,7 +36,6 @@ pub struct Renderer {
     fail_started: Option<f32>,
     last_status: Option<PromptStatus>,
     frame_stats: FrameStats,
-    power_save: bool,
 }
 
 #[derive(Default)]
@@ -95,8 +87,6 @@ struct DeviceState {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    blur: BlurPipeline,
-    rain: RainPipeline,
     ui: UiPipeline,
     surface_format: wgpu::TextureFormat,
 }
@@ -117,22 +107,13 @@ impl Renderer {
             dx12_shader_compiler: Default::default(),
             gles_minor_version: Default::default(),
         });
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| (d.as_nanos() % 1_000_000) as f32 * 0.001)
-            .unwrap_or(0.0);
         Self {
             instance,
             device_state: None,
             outputs: Vec::new(),
-            blur_passes: 4,
-            blur_offset: 3.0,
             start: Instant::now(),
-            backdrop_dim: 0.0,
-            seed,
             prompt: None,
             prompt_output: None,
-            awake: false,
             prompt_dots: vec![DotAnim::default(); MAX_DOTS as usize],
             last_chars: 0,
             unlock_started: None,
@@ -140,23 +121,11 @@ impl Renderer {
             fail_started: None,
             last_status: None,
             frame_stats: FrameStats::default(),
-            power_save: false,
         }
-    }
-
-    /// Battery mode: plain black background, no matrix rain, no blur.
-    /// The prompt UI renders unchanged on top.
-    pub fn set_power_save(&mut self, on: bool) {
-        self.power_save = on;
     }
 
     pub fn set_username(&mut self, name: impl Into<String>) {
         self.username = name.into();
-    }
-
-    pub fn set_blur(&mut self, passes: u32, offset: f32) {
-        self.blur_passes = passes.max(1);
-        self.blur_offset = offset.max(0.5);
     }
 
     pub fn set_prompt(&mut self, prompt: Option<PromptInfo>) {
@@ -215,15 +184,7 @@ impl Renderer {
         }
     }
 
-    pub fn set_awake(&mut self, awake: bool) {
-        self.awake = awake;
-    }
-
-    pub fn add_output(
-        &mut self,
-        target: SurfaceTarget,
-        screenshot: &Screenshot,
-    ) -> Result<OutputId> {
+    pub fn add_output(&mut self, target: SurfaceTarget) -> Result<OutputId> {
         let surface = unsafe {
             self.instance
                 .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -257,15 +218,11 @@ impl Renderer {
 
             let caps = surface.get_capabilities(&adapter);
             let surface_format = pick_format(&caps);
-            let blur = BlurPipeline::new(&device, surface_format);
-            let rain = RainPipeline::new(&device, surface_format);
             let ui = UiPipeline::new(&device, surface_format);
             self.device_state = Some(DeviceState {
                 adapter,
                 device,
                 queue,
-                blur,
-                rain,
                 ui,
                 surface_format,
             });
@@ -280,6 +237,18 @@ impl Renderer {
             .copied()
             .find(|m| matches!(*m, wgpu::CompositeAlphaMode::Opaque))
             .unwrap_or(caps.alpha_modes[0]);
+        // Mailbox over Fifo: the render loop is already paced by the
+        // compositor's frame callbacks, and Mesa's Wayland FIFO throttle
+        // adds a second callback round-trip per frame — measured as the
+        // client latching to every 4th vblank (75 fps on the 300 Hz
+        // panel) with 3/4/5-vblank judder. Mailbox never blocks, so one
+        // callback = one frame at the compositor's full rate.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        log::info!("present mode: {:?}", present_mode);
 
         surface.configure(
             &ds.device,
@@ -288,28 +257,21 @@ impl Renderer {
                 format,
                 width: target.width.max(1),
                 height: target.height.max(1),
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode,
                 alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
         );
 
-        let (bg_texture, bg_view) = upload_screenshot(&ds.device, &ds.queue, screenshot);
-
         let id = OutputId(self.outputs.len());
         self.outputs.push(OutputState {
             surface,
             format,
             alpha_mode,
+            present_mode,
             width: target.width.max(1),
             height: target.height.max(1),
-            bg_view,
-            bg_width: screenshot.width,
-            bg_height: screenshot.height,
-            mip_chain: Vec::new(),
-            blurred_offset: None,
-            _bg_texture: bg_texture,
         });
         Ok(id)
     }
@@ -326,13 +288,12 @@ impl Renderer {
                 format: o.format,
                 width: o.width,
                 height: o.height,
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode: o.present_mode,
                 alpha_mode: o.alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
         );
-        o.mip_chain.clear();
     }
 
     pub fn render(&mut self, id: &OutputId) -> Result<()> {
@@ -341,27 +302,11 @@ impl Renderer {
         let progresses = self.tick_dots(time);
         let prompt = self.prompt;
         let prompt_output = self.prompt_output;
-        let blur_passes = self.blur_passes;
-        let effective_blur_offset = self.blur_offset * fade;
-        let backdrop_dim = self.backdrop_dim;
-        let seed = self.seed;
-        let awake = self.awake;
         let username = self.username.clone();
         let fail_age = self.fail_started.map(|t0| (time - t0).max(0.0));
 
-        let power_save = self.power_save;
         let ds = self.device_state.as_mut().context("no device")?;
         let o = self.outputs.get_mut(id.0).context("no output")?;
-
-        let chain_rebuilt = if power_save {
-            false
-        } else {
-            ds.blur
-                .ensure_chain(&ds.device, &mut o.mip_chain, o.width, o.height, blur_passes)
-        };
-        if chain_rebuilt {
-            o.blurred_offset = None;
-        }
 
         let acquire_start = Instant::now();
         let frame = match o.surface.get_current_texture() {
@@ -374,7 +319,7 @@ impl Renderer {
                         format: o.format,
                         width: o.width,
                         height: o.height,
-                        present_mode: wgpu::PresentMode::Fifo,
+                        present_mode: o.present_mode,
                         alpha_mode: o.alpha_mode,
                         view_formats: vec![],
                         desired_maximum_frame_latency: 2,
@@ -398,7 +343,7 @@ impl Renderer {
                         format: o.format,
                         width: o.width,
                         height: o.height,
-                        present_mode: wgpu::PresentMode::Fifo,
+                        present_mode: o.present_mode,
                         alpha_mode: o.alpha_mode,
                         view_formats: vec![],
                         desired_maximum_frame_latency: 2,
@@ -424,59 +369,21 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        if power_save {
-            // Battery: static black background — no blur, no rain. The
-            // empty pass just clears; the UI pass below loads on top.
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("black bg"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-        } else {
-            if o.blurred_offset != Some(effective_blur_offset) {
-                ds.blur.render_blur(
-                    &ds.device,
-                    &mut encoder,
-                    &o.bg_view,
-                    o.bg_width,
-                    o.bg_height,
-                    &o.mip_chain,
-                    effective_blur_offset,
-                );
-                o.blurred_offset = Some(effective_blur_offset);
-            }
-
-            let blurred_view = if let Some(first) = o.mip_chain.first() {
-                &first.view
-            } else {
-                &o.bg_view
-            };
-
-            ds.rain.render(
-                &ds.device,
-                &ds.queue,
-                &mut encoder,
-                id.0,
-                chain_rebuilt,
-                blurred_view,
-                &view,
-                o.width,
-                o.height,
-                time,
-                backdrop_dim,
-                seed,
-                awake,
-            );
-        }
+        // Black background. The empty pass clears; the UI pass loads on top.
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("black bg"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
 
         let show_prompt = match prompt_output {
             Some(target) => target == *id,
@@ -538,48 +445,6 @@ fn pick_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
         .copied()
         .find(|f| matches!(*f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
         .unwrap_or(caps.formats[0])
-}
-
-fn upload_screenshot(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shot: &Screenshot,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("screenshot"),
-        size: wgpu::Extent3d {
-            width: shot.width.max(1),
-            height: shot.height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        shot.pixels,
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(shot.stride),
-            rows_per_image: Some(shot.height),
-        },
-        wgpu::Extent3d {
-            width: shot.width,
-            height: shot.height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
 }
 
 const MAX_DOTS: u32 = 32;

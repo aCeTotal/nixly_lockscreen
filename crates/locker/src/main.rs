@@ -1,5 +1,3 @@
-mod screencopy;
-
 use std::ptr::NonNull;
 use std::time::Instant;
 
@@ -8,7 +6,7 @@ use auth::{Authenticator, Verdict};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
-use render::{OutputId, PromptInfo, PromptStatus, Renderer, Screenshot, SurfaceTarget};
+use render::{OutputId, PromptInfo, PromptStatus, Renderer, SurfaceTarget};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
@@ -31,8 +29,6 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, Proxy, QueueHandle,
 };
-
-use screencopy::CapturedOutput;
 
 const LOCKGUARD_SOCK: &str = "/run/nixly-lockguard.sock";
 
@@ -85,7 +81,6 @@ fn main() -> Result<()> {
     let mut state = State {
         renderer: None,
         lock_surfaces: Vec::new(),
-        captures: Vec::new(),
         keyboard: None,
         pointer: None,
         registry_state: RegistryState::new(&globals),
@@ -107,18 +102,11 @@ fn main() -> Result<()> {
         cursor_output: None,
         last_auto_attempt: None,
         no_auth,
-        on_battery: on_battery(),
-        last_power_check: Instant::now(),
     };
 
     event_queue.roundtrip(&mut state)?;
 
-    let outputs: Vec<wl_output::WlOutput> = state.output_state.outputs().collect();
-    log::info!("discovered {} outputs", outputs.len());
-
-    let captures = screencopy::capture_all(&conn, &globals, &outputs)?;
-    log::info!("captured {} outputs", captures.len());
-    state.captures = captures;
+    log::info!("discovered {} outputs", state.output_state.outputs().count());
 
     let session_lock = state
         .session_lock_state
@@ -128,7 +116,6 @@ fn main() -> Result<()> {
 
     let mut renderer = Renderer::new();
     renderer.set_username(user);
-    renderer.set_power_save(state.on_battery);
     state.renderer = Some(renderer);
 
     state.create_lock_surfaces();
@@ -169,7 +156,6 @@ struct LockSurface {
 struct State {
     renderer: Option<Renderer>,
     lock_surfaces: Vec<LockSurface>,
-    captures: Vec<CapturedOutput>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 
@@ -196,44 +182,13 @@ struct State {
     cursor_output: Option<OutputId>,
     last_auto_attempt: Option<String>,
     no_auth: bool,
-    on_battery: bool,
-    last_power_check: Instant,
-}
-
-/* On battery the lockscreen shows a black background instead of matrix
- * rain. Mirrors nixlytile's powersave rule: a Battery supply reporting
- * "Discharging" means battery; anything else (AC, full, no battery at
- * all — desktops) means wall power. */
-fn on_battery() -> bool {
-    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
-        return false;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        let is_battery = std::fs::read_to_string(p.join("type"))
-            .map(|t| t.trim() == "Battery")
-            .unwrap_or(false);
-        if !is_battery {
-            continue;
-        }
-        if let Ok(status) = std::fs::read_to_string(p.join("status")) {
-            if status.trim() == "Discharging" {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 const MAX_PASSWORD_LEN: usize = 128;
 const PROMPT_TIMEOUT_S: f32 = 15.0;
 const FAIL_FLASH_S: f32 = 1.2;
-const IDLE_TO_SCREENSAVER_S: f32 = 15.0;
+const IDLE_TO_BLACK_S: f32 = 15.0;
 const AUTO_VERIFY_DEBOUNCE_MS: u128 = 1000;
-// On battery the background is a static black frame instead of matrix rain;
-// re-check the power state at this interval so plugging/unplugging while
-// locked switches mode without a restart.
-const POWER_CHECK_INTERVAL_S: u64 = 5;
 const AUTO_VERIFY_MIN_LEN: usize = 4;
 
 const DEMO_MODE: bool = false;
@@ -272,30 +227,6 @@ impl State {
             .as_mut()
             .context("renderer not initialised")?;
 
-        // Outputs that appear after the lock started (lid reopened after a
-        // lid-close suspend removed the panel) have no screenshot. Falling
-        // back to a solid dark background instead of erroring is critical:
-        // the error path left the lock surface without a buffer, so it never
-        // mapped — black screen, no prompt, no keyboard focus, session
-        // unrecoverable without a hard reboot.
-        let (pixels, cap_w, cap_h) = match self.captures.iter().find(|c| c.output == surf.output) {
-            Some(capture) => (
-                screencopy::shm_format_to_render_pixels(capture),
-                capture.width,
-                capture.height,
-            ),
-            None => {
-                log::warn!("no capture for output; using fallback background");
-                let (w, h) = (8u32, 8u32);
-                let mut px = vec![0u8; (w * h * 4) as usize];
-                for p in px.chunks_exact_mut(4) {
-                    // BGRA: dark slate #0b0f14
-                    p.copy_from_slice(&[0x14, 0x0f, 0x0b, 0xff]);
-                }
-                (px, w, h)
-            }
-        };
-
         let raw_display = make_display_handle(&self.conn)?;
         let raw_window = make_window_handle(surf.surface.wl_surface())?;
         let target = SurfaceTarget {
@@ -304,17 +235,15 @@ impl State {
             width: surf.width,
             height: surf.height,
         };
-        let id = renderer.add_output(
-            target,
-            &Screenshot {
-                width: cap_w,
-                height: cap_h,
-                stride: cap_w * 4,
-                pixels: &pixels,
-            },
-        )?;
+        let id = renderer.add_output(target)?;
         self.lock_surfaces[idx].output_id = Some(id);
         Ok(())
+    }
+
+    // The idle screen is a static black frame, so the callback loop only
+    // runs while something animates. Any input kicks it back to life.
+    fn needs_frames(&self) -> bool {
+        self.unlock_pending || (self.awake && self.prompt_status.is_some())
     }
 
     fn render_surface(&mut self, idx: usize) {
@@ -323,7 +252,7 @@ impl State {
         // Request the frame callback without committing: an empty commit before
         // the first buffer is a session-lock protocol error (null_buffer). The
         // wgpu present below commits the surface and carries the request along.
-        if !self.lock_surfaces[idx].pending_render {
+        if self.needs_frames() && !self.lock_surfaces[idx].pending_render {
             let wl = self.lock_surfaces[idx].surface.wl_surface().clone();
             wl.frame(&self.qh, wl.clone());
             self.lock_surfaces[idx].pending_render = true;
@@ -342,7 +271,7 @@ impl State {
         };
         if presented {
             self.lock_surfaces[idx].presented = true;
-        } else if self.lock_surfaces[idx].presented {
+        } else if self.lock_surfaces[idx].pending_render && self.lock_surfaces[idx].presented {
             // The frame request above only reaches the compositor with a
             // commit. If nothing was presented this pass, the request is
             // orphaned, no callback ever fires and the render loop dies —
@@ -360,23 +289,8 @@ impl State {
     }
 
     fn tick_prompt(&mut self) {
-        if self.last_power_check.elapsed().as_secs() >= POWER_CHECK_INTERVAL_S {
-            self.last_power_check = Instant::now();
-            let bat = on_battery();
-            if bat != self.on_battery {
-                self.on_battery = bat;
-                log::info!(
-                    "power: {}",
-                    if bat { "battery — black background" } else { "AC — matrix rain" }
-                );
-            }
-        }
-        if let Some(r) = self.renderer.as_mut() {
-            r.set_power_save(self.on_battery);
-        }
         if DEMO_MODE {
             if let Some(r) = self.renderer.as_mut() {
-                r.set_awake(false);
                 r.set_prompt(None);
             }
             return;
@@ -384,7 +298,7 @@ impl State {
         let now = Instant::now();
         let elapsed_since_input = now.duration_since(self.last_input).as_secs_f32();
 
-        if self.awake && elapsed_since_input > IDLE_TO_SCREENSAVER_S {
+        if self.awake && elapsed_since_input > IDLE_TO_BLACK_S {
             self.awake = false;
             self.clear_prompt();
         }
@@ -407,10 +321,6 @@ impl State {
                 self.last_auto_attempt = None;
                 self.prompt_status = Some(PromptStatus::Typing);
             }
-        }
-
-        if let Some(r) = self.renderer.as_mut() {
-            r.set_awake(self.awake);
         }
 
         self.maybe_auto_verify(now);
@@ -477,7 +387,8 @@ impl State {
         }
     }
 
-    fn handle_input_activity(&mut self) -> bool {
+    // Any input goes straight to the password prompt.
+    fn handle_input_activity(&mut self) {
         self.last_input = Instant::now();
         if self.no_auth {
             if !self.unlock_pending {
@@ -486,18 +397,17 @@ impl State {
                 if let Some(r) = self.renderer.as_mut() {
                     r.start_unlock();
                 }
-                self.request_all_frames();
             }
-            return true;
+            return;
         }
-        if !self.awake {
-            self.awake = true;
-            if !self.authenticator.is_locked_out() {
-                self.prompt_status = Some(PromptStatus::Typing);
-            }
-            return true;
+        self.awake = true;
+        if self.prompt_status.is_none() {
+            self.prompt_status = Some(if self.authenticator.is_locked_out() {
+                PromptStatus::LockedOut
+            } else {
+                PromptStatus::Typing
+            });
         }
-        false
     }
 
     fn update_renderer_prompt(&mut self) {
@@ -524,6 +434,13 @@ impl State {
         self.prompt_buf.clear();
         self.prompt_status = None;
         self.last_auto_attempt = None;
+    }
+
+    // Restart the callback loop after input if anything needs drawing.
+    fn kick_frames(&mut self) {
+        if self.needs_frames() {
+            self.request_all_frames();
+        }
     }
 
     fn request_all_frames(&mut self) {
@@ -554,7 +471,7 @@ impl State {
             }
             return;
         }
-        let was_asleep = self.handle_input_activity();
+        self.handle_input_activity();
 
         if self.authenticator.is_locked_out() {
             self.prompt_status = Some(PromptStatus::LockedOut);
@@ -562,12 +479,9 @@ impl State {
             return;
         }
 
-        if was_asleep {
-            return;
-        }
-
         match event.keysym {
             Keysym::Escape => {
+                self.awake = false;
                 self.clear_prompt();
                 return;
             }
@@ -786,6 +700,7 @@ impl KeyboardHandler for State {
     ) {
         log::debug!("key {:?}", event.keysym);
         self.handle_keypress(event);
+        self.kick_frames();
     }
     fn release_key(
         &mut self,
@@ -898,6 +813,7 @@ impl PointerHandler for State {
         }
         if real_input {
             self.handle_input_activity();
+            self.kick_frames();
         }
     }
 }
