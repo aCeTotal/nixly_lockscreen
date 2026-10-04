@@ -25,7 +25,7 @@ pub struct PromptInfo {
 pub struct Renderer {
     instance: wgpu::Instance,
     device_state: Option<DeviceState>,
-    outputs: Vec<OutputState>,
+    outputs: Vec<Option<OutputState>>,
     start: Instant,
     prompt: Option<PromptInfo>,
     prompt_output: Option<OutputId>,
@@ -265,20 +265,26 @@ impl Renderer {
         );
 
         let id = OutputId(self.outputs.len());
-        self.outputs.push(OutputState {
+        self.outputs.push(Some(OutputState {
             surface,
             format,
             alpha_mode,
             present_mode,
             width: target.width.max(1),
             height: target.height.max(1),
-        });
+        }));
         Ok(id)
+    }
+
+    pub fn remove_output(&mut self, id: &OutputId) {
+        if let Some(slot) = self.outputs.get_mut(id.0) {
+            *slot = None;
+        }
     }
 
     pub fn resize(&mut self, id: &OutputId, width: u32, height: u32) {
         let Some(ds) = self.device_state.as_ref() else { return };
-        let Some(o) = self.outputs.get_mut(id.0) else { return };
+        let Some(Some(o)) = self.outputs.get_mut(id.0) else { return };
         o.width = width.max(1);
         o.height = height.max(1);
         o.surface.configure(
@@ -306,7 +312,11 @@ impl Renderer {
         let fail_age = self.fail_started.map(|t0| (time - t0).max(0.0));
 
         let ds = self.device_state.as_mut().context("no device")?;
-        let o = self.outputs.get_mut(id.0).context("no output")?;
+        let o = self
+            .outputs
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .context("no output")?;
 
         let acquire_start = Instant::now();
         let frame = match o.surface.get_current_texture() {

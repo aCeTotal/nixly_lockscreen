@@ -617,7 +617,19 @@ impl OutputHandler for State {
         }
     }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+    // Drop the wgpu surface before its wl_surface.
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(idx) = self.lock_surfaces.iter().position(|s| s.output == output) else {
+            return;
+        };
+        let surf = self.lock_surfaces.remove(idx);
+        let Some(id) = surf.output_id else { return };
+        if self.cursor_output == Some(id) {
+            self.cursor_output = None;
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.remove_output(&id);
+        }
     }
 }
 
